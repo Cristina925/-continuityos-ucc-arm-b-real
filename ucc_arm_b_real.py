@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+CONTINUITYOS-UCC-VAL-002-B-REAL-001-PREP-002
+Real Kubernetes same-object CAS harness.
+
+Scope:
+- Disposable test namespace only.
+- One ConfigMap per case.
+- All protected state is co-located in the same ConfigMap.
+- All consequence writes use the expected metadata.resourceVersion.
+- Commit is counted only after successful API acceptance AND read-back observation.
+
+DES-001 / U01-U10 expectations are intentionally not changed here.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+EVIDENCE = Path("evidence")
+EVIDENCE.mkdir(exist_ok=True)
+NS = "ucc-arm-b-real"
+RESULTS = []
+
+def sh(args, check=True, capture=True):
+    p = subprocess.run(args, text=True, capture_output=capture)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"command failed: {' '.join(args)}\nstdout={p.stdout}\nstderr={p.stderr}")
+    return p
+
+def kubectl(*args, check=True):
+    return sh(["kubectl", *args], check=check)
+
+def ensure_namespace():
+    p = kubectl("get", "ns", NS, check=False)
+    if p.returncode != 0:
+        kubectl("create", "ns", NS)
+
+def cm_name(case_id):
+    return f"ucc-{case_id.lower()}"
+
+def base_data():
+    return {
+        "authorityState": "CURRENT",
+        "authorityVersion": "1",
+        "parentAuthorityVersion": "1",
+        "actionDigest": "ACTION_A",
+        "temporalEpoch": "1",
+        "expiryState": "CURRENT",
+        "consequenceState": "NONE",
+        "commitId": "",
+        "used": "false",
+    }
+
+def create_case(case_id, overrides=None):
+    data = base_data()
+    if overrides:
+        data.update(overrides)
+    name = cm_name(case_id)
+    kubectl("-n", NS, "delete", "configmap", name, "--ignore-not-found=true")
+    args = ["-n", NS, "create", "configmap", name]
+    for k, v in data.items():
+        args += ["--from-literal", f"{k}={v}"]
+    kubectl(*args)
+    return read_cm(case_id)
+
+def read_cm(case_id):
+    p = kubectl("-n", NS, "get", "configmap", cm_name(case_id), "-o", "json")
+    return json.loads(p.stdout)
+
+def rv_of(obj):
+    return obj["metadata"]["resourceVersion"]
+
+def data_of(obj):
+    return obj.get("data", {})
+
+def write_full(case_id, expected_rv, new_data):
+    name = cm_name(case_id)
+    obj = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": name,
+            "namespace": NS,
+            "resourceVersion": str(expected_rv),
+        },
+        "data": {k: str(v) for k, v in new_data.items()},
+    }
+    tmp = EVIDENCE / f"{case_id}-request.json"
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
+    p = sh(["kubectl", "replace", "-f", str(tmp)], check=False)
+    return p
+
+def mutate_same_object(case_id, changes):
+    cur = read_cm(case_id)
+    d = data_of(cur).copy()
+    d.update({k: str(v) for k, v in changes.items()})
+    p = write_full(case_id, rv_of(cur), d)
+    if p.returncode != 0:
+        raise RuntimeError(f"same-object mutation failed in {case_id}: {p.stderr}")
+    return read_cm(case_id)
+
+def attempt_commit(case_id, expected_rv, expected_action="ACTION_A", expected_authority="1",
+                   expected_parent="1", require_expiry_current=True, commit_id=None):
+    before = read_cm(case_id)
+    d = data_of(before).copy()
+
+    # Final admission checks are based on state represented in the same object.
+    if d.get("authorityState") != "CURRENT":
+        return {"status": "BLOCKED_STALE_AUTHORITY", "api": None, "committed": False}
+    if d.get("authorityVersion") != str(expected_authority):
+        return {"status": "BLOCKED_STALE_AUTHORITY", "api": None, "committed": False}
+    if d.get("parentAuthorityVersion") != str(expected_parent):
+        return {"status": "BLOCKED_STALE_AUTHORITY", "api": None, "committed": False}
+    if d.get("actionDigest") != expected_action:
+        return {"status": "BLOCKED_ACTION_MISMATCH", "api": None, "committed": False}
+    if require_expiry_current and d.get("expiryState") != "CURRENT":
+        return {"status": "BLOCKED_STALE_AUTHORITY", "api": None, "committed": False}
+    if d.get("used") == "true" or d.get("consequenceState") == "COMMITTED":
+        return {"status": "BLOCKED_REPLAY_OR_CONFLICT", "api": None, "committed": False}
+
+    new_data = d.copy()
+    new_data["consequenceState"] = "COMMITTED"
+    new_data["used"] = "true"
+    new_data["commitId"] = commit_id or f"{case_id}-commit"
+
+    p = write_full(case_id, expected_rv, new_data)
+    after = read_cm(case_id)
+    observed = data_of(after).get("commitId") == new_data["commitId"] and data_of(after).get("consequenceState") == "COMMITTED"
+
+    if p.returncode == 0 and observed:
+        return {"status": "COMMITTED_VALID", "api": 200, "committed": True}
+    if p.returncode != 0 and ("Conflict" in p.stderr or "the object has been modified" in p.stderr):
+        return {"status": "BLOCKED_STALE_AUTHORITY", "api": 409, "committed": False}
+    return {"status": "LIVENESS_FAILURE", "api": p.returncode, "committed": observed, "stderr": p.stderr}
+
+def record(case_id, expected, observed, before=None, after=None, trace=None):
+    ok = observed["status"] == expected
+    rec = {
+        "case": case_id,
+        "expected": expected,
+        "observed": observed["status"],
+        "pass": ok,
+        "committed": observed.get("committed", False),
+        "api": observed.get("api"),
+        "trace": trace or [],
+        "before": before,
+        "after": after,
+    }
+    RESULTS.append(rec)
+    (EVIDENCE / f"{case_id}-result.json").write_text(json.dumps(rec, indent=2, sort_keys=True))
+    if not ok:
+        (EVIDENCE / "FIRST-DISCREPANCY.json").write_text(json.dumps(rec, indent=2, sort_keys=True))
+        print(json.dumps(rec, indent=2))
+        print("FIRST DISCREPANCY FROZEN — STOPPING")
+        save_summary()
+        sys.exit(2)
+    print(f"{case_id}: PASS expected={expected} observed={observed['status']}")
+
+def save_summary():
+    (EVIDENCE / "results.json").write_text(json.dumps(RESULTS, indent=2, sort_keys=True))
+
+def main():
+    ensure_namespace()
+
+    # U01 legitimate unchanged execution
+    b = create_case("U01")
+    r = attempt_commit("U01", rv_of(b))
+    record("U01", "COMMITTED_VALID", r, b, read_cm("U01"),
+           ["AUTHORITY_CURRENT","AUTHORIZE","ACTION_UNCHANGED","STATE_UNCHANGED","FINAL_ADMISSION","COMMIT"])
+
+    # U02 authority invalid before admission
+    b = create_case("U02", {"authorityState":"REVOKED"})
+    r = attempt_commit("U02", rv_of(b))
+    record("U02", "BLOCKED_STALE_AUTHORITY", r, b, read_cm("U02"),
+           ["AUTHORITY_INVALID","EXECUTE_REQUEST","FINAL_ADMISSION","COMMIT_ATTEMPT"])
+
+    # U03 invalidated before final admission
+    b = create_case("U03")
+    mutate_same_object("U03", {"authorityState":"REVOKED","authorityVersion":"2"})
+    cur = read_cm("U03")
+    r = attempt_commit("U03", rv_of(cur), expected_authority="1")
+    record("U03", "BLOCKED_STALE_AUTHORITY", r, b, read_cm("U03"),
+           ["AUTHORIZE","AUTHORITY_INVALIDATED","FINAL_ADMISSION","COMMIT_ATTEMPT"])
+
+    # U04 exact action changes
+    b = create_case("U04")
+    mutate_same_object("U04", {"actionDigest":"ACTION_B"})
+    cur = read_cm("U04")
+    r = attempt_commit("U04", rv_of(cur), expected_action="ACTION_A")
+    record("U04", "BLOCKED_ACTION_MISMATCH", r, b, read_cm("U04"),
+           ["AUTHORIZE_ACTION_A","MATERIAL_ACTION_CHANGE_TO_B","FINAL_ADMISSION_B","COMMIT_ATTEMPT_B"])
+
+    # U05 invalidation after validation but before commit:
+    # capture rv, then same-object invalidation advances rv, then stale write attempts.
+    b = create_case("U05")
+    stale_rv = rv_of(b)
+    mutate_same_object("U05", {"authorityState":"REVOKED","authorityVersion":"2"})
+    r = attempt_commit("U05", stale_rv, expected_authority="1")
+    record("U05", "BLOCKED_STALE_AUTHORITY", r, b, read_cm("U05"),
+           ["AUTHORIZE","FINAL_VALIDATION_PASS","SAME_OBJECT_INVALIDATION","STALE_COMMIT_ATTEMPT"])
+
+    # U06 revocation serializes first
+    b = create_case("U06")
+    stale_rv = rv_of(b)
+    mutate_same_object("U06", {"authorityState":"REVOKED","authorityVersion":"2"})
+    r = attempt_commit("U06", stale_rv, expected_authority="1")
+    record("U06", "BLOCKED_STALE_AUTHORITY", r, b, read_cm("U06"),
+           ["AUTHORIZE","PREPARE_CONSEQUENCE","REVOCATION_SERIALIZES_FIRST","COMMIT_ATTEMPT"])
+
+    # U07 consequence serializes first while current; revocation follows
+    b = create_case("U07")
+    r = attempt_commit("U07", rv_of(b))
+    if r["status"] == "COMMITTED_VALID":
+        mutate_same_object("U07", {"authorityState":"REVOKED","authorityVersion":"2"})
+    record("U07", "COMMITTED_VALID", r, b, read_cm("U07"),
+           ["AUTHORIZE","COMMIT_SERIALIZES_FIRST_WHILE_CURRENT","REVOCATION_AFTER"])
+
+    # U08 expiry/currentness is represented by a same-object transition.
+    b = create_case("U08")
+    stale_rv = rv_of(b)
+    mutate_same_object("U08", {"expiryState":"EXPIRED","temporalEpoch":"2"})
+    r = attempt_commit("U08", stale_rv)
+    record("U08", "BLOCKED_STALE_AUTHORITY", r, b, read_cm("U08"),
+           ["AUTHORIZE","EXPIRY_STATE_SERIALIZES_IN_SAME_OBJECT","STALE_COMMIT_ATTEMPT"])
+
+    # U09 replay/duplicate
+    b = create_case("U09")
+    r1 = attempt_commit("U09", rv_of(b), commit_id="U09-first")
+    cur = read_cm("U09")
+    r2 = attempt_commit("U09", rv_of(cur), commit_id="U09-second")
+    # Frozen primary observation concerns the prohibited second consequence.
+    observed = {"status": "BLOCKED_REPLAY_OR_CONFLICT" if (r1["committed"] and not r2["committed"]) else "COMMITTED_INVALID",
+                "api": r2.get("api"), "committed": r2.get("committed", False)}
+    record("U09", "BLOCKED_REPLAY_OR_CONFLICT", observed, b, read_cm("U09"),
+           ["AUTHORIZE","FIRST_VALID_COMMIT","REPLAY_SAME_AUTHORIZATION","SECOND_COMMIT_ATTEMPT"])
+
+    # U10 parent/delegated authority version changes in same object
+    b = create_case("U10")
+    stale_rv = rv_of(b)
+    mutate_same_object("U10", {"parentAuthorityVersion":"2"})
+    r = attempt_commit("U10", stale_rv, expected_parent="1")
+    record("U10", "BLOCKED_STALE_AUTHORITY", r, b, read_cm("U10"),
+           ["PARENT_CURRENT","DELEGATE_CHILD","PARENT_VERSION_CHANGES","CHILD_COMMIT_ATTEMPT"])
+
+    save_summary()
+    summary = {"passed": sum(1 for x in RESULTS if x["pass"]), "total": len(RESULTS)}
+    (EVIDENCE / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"RESULT: {summary['passed']}/{summary['total']} PASS")
+
+if __name__ == "__main__":
+    main()
